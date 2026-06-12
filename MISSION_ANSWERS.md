@@ -21,3 +21,37 @@
 | **Shutdown** | Abrupt terminate | Graceful Shutdown (lifespan manager, `SIGTERM` handler) | Ensures active connections and in-flight HTTP requests complete without loss of data or connection truncation. |
 
 ---
+
+## Part 2: Docker
+
+### Exercise 2.1: Dockerfile concepts (develop version)
+1. **Base Image:** `python:3.11`. This is a full-featured Debian-based Python image. It is quite large (~1 GB) because it contains full build systems and compilers.
+2. **Working Directory:** `/app`. This sets the default directory inside the container for all subsequent commands (COPY, RUN, CMD).
+3. **Why COPY requirements.txt first?** This separates dependency installation from source code copies. By copying only `requirements.txt` first and running `pip install`, Docker can cache the installed packages layer. Future builds will bypass `pip install` unless `requirements.txt` actually changes, significantly speeding up build times.
+4. **CMD vs ENTRYPOINT:**
+   - `CMD` provides default arguments or commands that can be easily overridden when running `docker run <image> <override-command>`.
+   - `ENTRYPOINT` sets the primary executable. Arguments passed to `docker run` are appended to the entrypoint rather than overriding it.
+
+### Exercise 2.3: Image size comparison
+- **Develop Image (`my-agent:develop`):** ~1.02 GB (1020 MB)
+- **Production Image (`my-agent:advanced`):** ~142 MB
+- **Difference:** ~86% reduction in size.
+- **Why it is smaller:** The production version uses `python:3.11-slim` as the base image (which excludes large compilers and packages) and implements a **multi-stage build**. The build dependencies (`gcc`, `libpq-dev`) are installed and used only in the first stage (`builder`), while the final stage (`runtime`) only copies the pre-built Python dependencies and code, resulting in a clean and minimal runtime image.
+
+### Exercise 2.4: Docker Compose stack architecture
+```
+Client (Port 80) ────> Nginx (Reverse Proxy/LB) 
+                                │
+                 ┌──────────────┴──────────────┐
+                 ▼                             ▼
+        Agent 1 (Port 8000)           Agent 2 (Port 8000)
+                 │                             │
+                 └──────────────┬──────────────┘
+                                ▼
+                       Redis (Port 6379)
+```
+- **Services started:** `nginx`, `agent` (2 replicas), `redis`, `qdrant`.
+- **Communication:** Services communicate using Docker's internal user-defined network (`internal`). Nginx acts as the single entry point, routing requests to the stateless agent containers. Agents access Redis for rate-limiting/session storage and Qdrant for vector storage.
+
+---
+
