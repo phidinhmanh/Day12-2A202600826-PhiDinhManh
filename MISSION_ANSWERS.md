@@ -55,3 +55,84 @@ Client (Port 80) ────> Nginx (Reverse Proxy/LB)
 
 ---
 
+## Part 3: Cloud Deployment
+
+### Exercise 3.1: Railway vs Render Deployment Configuration Comparison
+- **Railway Configuration (`railway.toml`):**
+  - **Builder:** Uses `builder = "NIXPACKS"`, which automatically detects the runtime, installs dependencies, and prepares the runner image without needing a custom Dockerfile.
+  - **Start Command:** Uses `startCommand = "uvicorn app:app --host 0.0.0.0 --port $PORT"`. The port is dynamically injected by Railway using `$PORT`.
+  - **Health Check:** Uses `healthcheckPath = "/health"` and `healthcheckTimeout = 30` directly inside the configuration file.
+  - **Restart Policy:** Defined via `restartPolicyType = "ON_FAILURE"` and `restartPolicyMaxRetries = 3`.
+- **Render Configuration (`render.yaml`):**
+  - **Infrastructure as Code (IaC):** Uses Render blueprints (`render.yaml`).
+  - **Service Types:** Declares both a web service (`ai-agent`) and a Redis service (`agent-cache`) together, allowing infrastructure dependencies to be configured and spun up in sync.
+  - **Runtime & Version:** Explicitly defines `runtime: python` and specifies `PYTHON_VERSION` (3.11.0) under `envVars`.
+  - **Build Command:** Defines `buildCommand: pip install -r requirements.txt` separately from `startCommand`.
+  - **Secrets & Auto-Generation:** Can define env keys like `AGENT_API_KEY` with `generateValue: true` to let Render generate random keys, and set `sync: false` to allow manual dashboard settings.
+
+---
+
+## Part 4: API Security
+
+### Exercise 4.1-4.3: Test results
+
+#### 1. Basic API Key Authentication (Develop app)
+- Request without API Key:
+```json
+HTTP/1.1 401 Unauthorized
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+```
+- Request with valid API Key (`demo-key-change-in-production`):
+```json
+HTTP/1.1 200 OK
+{"question":"Hello","answer":"[Mock LLM] Dịch vụ đang sẵn sàng! Bạn vừa hỏi: Hello"}
+```
+
+#### 2. Advanced Security Stack (Production app with JWT + Rate Limiting)
+- JWT Token request (`POST /auth/token` with credentials `student`/`demo123`):
+```json
+HTTP/1.1 200 OK
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5c...",
+  "token_type": "bearer",
+  "expires_in_minutes": 60,
+  "hint": "Include in header: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5c..."
+}
+```
+- Query `/ask` using the retrieved JWT:
+```json
+HTTP/1.1 200 OK
+{
+  "question": "Explain Docker in one sentence.",
+  "answer": "Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!",
+  "usage": {
+    "requests_remaining": 9,
+    "budget_remaining_usd": 1.9e-05
+  }
+}
+```
+- Rate Limiting Verification (flooding 12 requests in a window):
+```
+Request #1: HTTP 200 (OK)
+Request #2: HTTP 200 (OK)
+Request #3: HTTP 200 (OK)
+Request #4: HTTP 200 (OK)
+Request #5: HTTP 200 (OK)
+Request #6: HTTP 200 (OK)
+Request #7: HTTP 200 (OK)
+Request #8: HTTP 200 (OK)
+Request #9: HTTP 200 (OK)
+Request #10: HTTP 429 Too Many Requests - {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":39}}
+Request #11: HTTP 429 Too Many Requests - {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":37}}
+Request #12: HTTP 429 Too Many Requests - {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":35}}
+```
+
+### Exercise 4.4: Cost guard implementation
+- **In-Memory Limitations:** The in-memory cost guard stores consumption in a local Python dictionary. This is stateful and will fail in a scaled production cluster where requests are load balanced across multiple containers, leading to inconsistent budget enforcement and out-of-budget billing.
+- **Stateless Production Approach:**
+  - **Redis Storage:** We decouple the cost record state into Redis. We store user consumption at the key: `budget:user:{user_id}:{current_date}`.
+  - **Thread-Safety & Race Conditions:** We use Redis atomic commands (e.g. `HINCRBY` / `HINCRBYFLOAT` inside `cost_guard.py` or a pipeline) to record input/output token usage.
+  - **Budget Check Before Execution:** Before initiating the LLM request, we do a Redis `GET` or `HGETALL` on `budget:user:{user_id}:{date}` and compare `cost_usd` against the threshold. If it exceeds the budget, the request is immediately blocked (throwing HTTP 402 Payment Required).
+  - **TTL management:** Daily keys are configured with a Time-To-Live (TTL) of 24 hours (`86400` seconds) to let Redis automatically expire old usage records, keeping memory clean.
+
+
