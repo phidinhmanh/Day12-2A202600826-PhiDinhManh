@@ -443,4 +443,213 @@ else:
 docker compose -f 05-scaling-reliability/production/docker-compose.yml down
 ```
 
+---
 
+## Part 6: Final Project Assembly & Validation
+
+### Exercise 6.1: Local 06-lab prerequisites
+
+Per PLAN Step 1, the `06-lab-complete/` project needs a `utils/` folder copy for local Docker builds (and a `.env.local` for `env_file` reference in `docker-compose.yml`).
+
+```powershell
+xcopy /E /I utils 06-lab-complete\utils     # PowerShell
+# or
+cp -r utils 06-lab-complete/utils           # Bash/Git Bash
+```
+
+| File | Status | Source |
+|---|---|---|
+| `app/main.py` | Pre-existing | scaffold |
+| `app/config.py` | Pre-existing | scaffold |
+| `Dockerfile` | Pre-existing | scaffold |
+| `docker-compose.yml` | Pre-existing | scaffold |
+| `railway.toml` | Pre-existing | scaffold |
+| `render.yaml` | Pre-existing | scaffold |
+| `requirements.txt` | Pre-existing | scaffold |
+| `utils/mock_llm.py` | **Copied from `../utils/`** | PLAN Step 1 |
+| `.env.example` | Pre-existing (scaffold) | scaffold |
+| `.dockerignore` | Pre-existing (scaffold) | scaffold |
+| `.env.local` | **Created for local staging** | this commit |
+
+`.env.local` is gitignored (via root `.gitignore` which has `.env*` patterns + project `.dockerignore`).
+
+### Exercise 6.2: Configuration verification (Pydantic-style dataclass)
+
+`app/config.py` uses `@dataclass` with `field(default_factory=lambda: os.getenv(...))` — same purpose as Pydantic settings, simpler API. Validates in `Settings.validate()`:
+
+```python
+if self.environment == "production":
+    if self.agent_api_key == "dev-key-change-me":
+        raise ValueError("AGENT_API_KEY must be set in production!")
+    if self.jwt_secret == "dev-jwt-secret":
+        raise ValueError("JWT_SECRET must be set in production!")
+```
+
+- In production mode → fail-fast on default secrets (prevents deploying with scaffold keys)
+- In staging/development → silently use defaults
+- Mock LLM warning if `OPENAI_API_KEY` empty
+
+### Exercise 6.3: Middleware stack in `app/main.py`
+
+| Layer | Implementation | Status |
+|---|---|---|
+| **API Key auth** | `verify_api_key` dep via `APIKeyHeader("X-API-Key")` | ✅ 401 on missing/wrong key |
+| **Rate limiting** | `check_rate_limit(key)` per-API-key sliding window | ⚠️ In-memory (see issue below) |
+| **Cost guard** | `check_and_record_cost(input_tokens, output_tokens)` per-day USD accumulator | ⚠️ In-memory (see issue below) |
+| **Pydantic validation** | `AskRequest(BaseModel)` with `Field(min_length=1, max_length=2000)` | ✅ |
+| **Structured logging** | `logger.info(json.dumps({"event":..., ...}))` JSON lines | ✅ |
+| **Liveness probe** | `GET /health` returns status, version, uptime, checks | ✅ |
+| **Readiness probe** | `GET /ready` returns 503 until `_is_ready=True` | ✅ |
+| **Graceful shutdown** | `signal.signal(SIGTERM, _handle_signal)` + uvicorn `timeout_graceful_shutdown=30` | ✅ |
+| **CORS** | `CORSMiddleware` with `settings.allowed_origins` from env | ✅ |
+| **Security headers** | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` | ✅ |
+| **Docs in prod** | `docs_url=None` when `environment == "production"` | ✅ |
+
+### Exercise 6.4: Pydantic validation test (live)
+
+| Test | Expected | Actual |
+|---|---|---|
+| `POST /ask` with `{}` body | 422 | **422** ✅ |
+| `POST /ask` with 2001-char question | 422 | **422** ✅ |
+| `POST /ask` with valid question + correct API key | 200 | **200** ✅ |
+| `POST /ask` with valid question + wrong API key | 401 | **401** ✅ |
+| `GET /health` | 200 + status JSON | **200** ✅ |
+| `GET /ready` | 200 + `{"ready":true}` | **200** ✅ |
+| `GET /` | 200 + endpoint catalog | **200** ✅ |
+| `GET /nonexistent` | 404 | **404** ✅ |
+| `GET /metrics` (auth) | 200 + counters | **200** ✅ (68 reqs, 0 errors observed) |
+
+### Exercise 6.5: Production-readiness checker (100%)
+
+```
+=======================================================
+  Production Readiness Check — Day 12 Lab
+=======================================================
+
+📁 Required Files
+  ✅ Dockerfile exists
+  ✅ docker-compose.yml exists
+  ✅ .dockerignore exists
+  ✅ .env.example exists
+  ✅ requirements.txt exists
+  ✅ railway.toml or render.yaml exists
+
+🔒 Security
+  ✅ .env in .gitignore
+  ✅ No hardcoded secrets in code
+
+🌐 API Endpoints (code check)
+  ✅ /health endpoint defined
+  ✅ /ready endpoint defined
+  ✅ Authentication implemented
+  ✅ Rate limiting implemented
+  ✅ Graceful shutdown (SIGTERM)
+  ✅ Structured logging (JSON)
+
+🐳 Docker
+  ✅ Multi-stage build
+  ✅ Non-root user
+  ✅ HEALTHCHECK instruction
+  ✅ Slim base image
+  ✅ .dockerignore covers .env
+  ✅ .dockerignore covers __pycache__
+
+=======================================================
+  Result: 20/20 checks passed (100%)
+  🎉 PRODUCTION READY! Deploy nào!
+=======================================================
+```
+
+### Exercise 6.6: Live integration test (stack up + 422/200 verified)
+
+**Bring up:**
+```powershell
+docker compose -f 06-lab-complete/docker-compose.yml up -d --build
+```
+
+**Bug fixed during deploy (silent restart loop → root cause):**
+
+1. **`ModuleNotFoundError: No module named 'uvicorn'`** — Dockerfile `runtime` stage used `pip install --user` (puts packages in `/home/agent/.local/lib/python3.11/site-packages`) but didn't export `PYTHONUSERBASE=/home/agent/.local`. Added the env var to Dockerfile `runtime` stage. Same fix as `05-scaling-reliability/production/Dockerfile` line 36.
+
+2. **`AttributeError: 'MutableHeaders' object has no attribute 'pop'`** — starlette `MutableHeaders` (FastAPI/Starlette 0.30+) removed `.pop()`. Changed `response.headers.pop("server", None)` to guarded `del response.headers["server"]`. Same fix as `04-api-gateway` (commit `fbb2c64`).
+
+**Verified endpoints (live, with staging API key `staging-key-abc123`):**
+
+```
+GET /health → 200 {"status":"ok","version":"1.0.0","environment":"staging",...}
+GET /ready →  200 {"ready":true}
+GET / →      200 {"app":"Production AI Agent","endpoints":{...}}
+POST /ask {} →          422  Field required
+POST /ask 2001-char →   422  String should have at most 2000 characters
+POST /ask valid →       200  {"question":"What is deployment?","answer":"..."}
+POST /ask wrong key →   401  Invalid or missing API key
+GET /metrics →          200  {"uptime_seconds":1548.6,"total_requests":68,...}
+```
+
+**Tear down:**
+```powershell
+docker compose -f 06-lab-complete/docker-compose.yml down
+```
+
+### Exercise 6.7: Known issues (anti-patterns flagged for future work)
+
+Codex review on Part 5 surfaced the same anti-patterns in Part 6's `app/main.py`. They are **not regressions** (scaffold pre-dates Part 5 fixes), but should be fixed before declaring "true production ready":
+
+1. **In-memory rate limiter (`_rate_windows: dict[str, deque]`)** — Does not work across multiple uvicorn workers. `CMD ["uvicorn", ..., "--workers", "2"]` runs 2 workers, each with its own dict → effective limit = 2× configured. **Fix:** Use Redis sliding window (`_redis.zadd` + `zremrangebyscore` + `zcard`), same pattern as `05-scaling-reliability/production/app.py:save_session`.
+
+2. **In-memory cost guard (`_daily_cost: float`)** — Same issue. Two workers = two independent budgets. **Fix:** Use Redis `HINCRBYFLOAT` per `(user, day)` with TTL 86400s.
+
+3. **No Redis integration in `main.py`** — `redis==5.1.0` is in `requirements.txt`, `REDIS_URL` is in `config.py`, but main.py never imports redis. The `redis` service in docker-compose is dead weight today. **Fix:** Wire `app/state.py` to manage redis client, used by rate limiter + cost guard.
+
+These are explicitly out of scope for PLAN Task 6 (which targets "checker 100% pass" — already met). They are documented here for the next iteration of the project.
+
+### Exercise 6.8: Architecture summary (final deliverable)
+
+```
+                    ┌─────────────────────────────────┐
+                    │  Railway / Render / any cloud   │
+                    │  NIXPACKS auto-detect or Docker  │
+                    └────────────┬────────────────────┘
+                                 │
+                          ┌──────┴──────┐
+                          │  Nginx LB   │ (optional, not in 06)
+                          └──────┬──────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    │  agent (uvicorn x2)     │
+                    │  + API Key + RateLimit  │
+                    │  + Cost Guard + Pydantic│
+                    │  + JSON logging         │
+                    │  + /health, /ready      │
+                    │  + SIGTERM graceful     │
+                    └────────────┬────────────┘
+                                 │
+                          ┌──────┴──────┐
+                          │  Redis 7    │  (future: shared state)
+                          └─────────────┘
+```
+
+**Deploy paths (all configured):**
+- **Railway:** `railway up` (uses `railway.toml`, NIXPACKS via DOCKERFILE builder)
+- **Render:** Push repo → Blueprint → reads `render.yaml`
+- **Local Docker:** `docker compose up` (uses `docker-compose.yml`)
+- **Bare metal:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+
+**Config contract (12-factor):** All settings via env vars, no hardcoded values, Pydantic-style dataclass validation, fail-fast on production-with-default-secrets.
+
+---
+
+## Final Status: 6/6 Tasks Complete
+
+| Task | Status | Commit |
+|---|---|---|
+| Part 1: Localhost vs Production | ✅ | `8ee9357` |
+| Part 2: Docker | ✅ | `5bd979b` |
+| Part 3: Cloud Deployment | ✅ | `f987d3a` + `d462dbf` |
+| Part 4: API Security | ✅ | `a48e903` |
+| Part 5: Scaling & Reliability | ✅ | `72b78e5` + `0141cc3` |
+| Part 6: Final Assembly | ✅ | this commit |
+
+**Production readiness checker:** 20/20 (100%) 🎉
+**Live integration test:** All 8 endpoint scenarios pass (200/200/422/422/200/401/404/200)
+**Documented gaps:** 3 known issues (in-memory state) listed in Exercise 6.7 for next iteration.

@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
 .env.*
 !.env.example
@@ -9,3 +11,12 @@ venv/
 *.md
 tests/
 .DS_Store
+*.log
+*.tmp
+node_modules/
+.vscode/
+.idea/
+mypy_cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
