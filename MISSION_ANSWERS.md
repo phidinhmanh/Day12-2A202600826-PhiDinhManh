@@ -211,4 +211,118 @@ Request #12: HTTP 429 Too Many Requests - {"detail":{"error":"Rate limit exceede
   - **Budget Check Before Execution:** Before initiating the LLM request, we do a Redis `GET` or `HGETALL` on `budget:user:{user_id}:{date}` and compare `cost_usd` against the threshold. If it exceeds the budget, the request is immediately blocked (throwing HTTP 402 Payment Required).
   - **TTL management:** Daily keys are configured with a Time-To-Live (TTL) of 24 hours (`86400` seconds) to let Redis automatically expire old usage records, keeping memory clean.
 
+---
+
+## Part 5: Scaling & Reliability
+
+### Exercise 5.1: Liveness vs Readiness probes
+
+Two distinct probes serve different purposes in production orchestration:
+
+| Probe | Endpoint | Question it answers | On failure |
+|---|---|---|---|
+| **Liveness** | `GET /health` | "Is the process alive?" | Platform **restarts the container** |
+| **Readiness** | `GET /ready` | "Can it accept traffic right now?" | Load balancer **stops routing requests** to it (keeps container alive) |
+
+**Why split them?**
+
+- A process can be **alive but not ready** — e.g. loading a model, warming a connection pool, waiting for a dependency. `/health` returns 200 (process running), `/ready` returns 503 (don't send traffic yet). The platform keeps the container alive and waits.
+- A process can be **unresponsive and need restart** — e.g. deadlock, OOM, broken event loop. `/health` returns 500 → platform kills + restarts.
+- Conflating them causes either: (a) restart loops during slow startup, or (b) zombie containers that receive traffic they can't handle.
+
+**Implementation in `develop/app.py`:**
+
+- `/health` returns dependency checks (memory, Redis ping, etc.) plus `uptime_seconds`, `version`, `timestamp`. Always 200 unless process is fundamentally broken.
+- `/ready` checks `_is_ready` flag (set to `True` only after startup work completes in `lifespan` context manager). Returns 503 during startup/shutdown.
+- A middleware tracks `_in_flight_requests` counter so `/ready` can also report load (K8s can use this to drain a node before shutdown).
+
+### Exercise 5.2: Graceful shutdown via SIGTERM + lifespan
+
+Cloud platforms send `SIGTERM` (not `SIGKILL`) when they want a container to stop — this is the polite "please finish what you're doing, then exit" signal. uvicorn catches `SIGTERM` and triggers FastAPI's `lifespan` shutdown phase.
+
+**Two-layer protection:**
+
+1. **uvicorn-level** — `timeout_graceful_shutdown=30` in `uvicorn.run(...)`. This caps how long uvicorn will wait for in-flight requests before forcefully closing them. Prevents a hung request from blocking deploys forever.
+2. **App-level** — the `lifespan` async context manager's shutdown branch:
+
+```python
+while _in_flight_requests > 0 and elapsed < timeout:
+    logger.info(f"Waiting for {_in_flight_requests} in-flight requests...")
+    time.sleep(1)
+    elapsed += 1
+```
+
+The middleware (`track_requests`) increments `_in_flight_requests` on entry and decrements in `finally` — so the counter is accurate even if the handler throws. The lifespan waits up to 30s for the counter to hit 0, then proceeds with cleanup.
+
+**Bonus:** `signal.signal(signal.SIGTERM, handle_sigterm)` registers a custom handler that logs the received signal — useful for debugging in production logs ("Received signal 15 — uvicorn will handle graceful shutdown").
+
+**Why this matters:** Without graceful shutdown, an in-flight LLM request (could take 10–30s for streaming responses) gets truncated mid-stream when the new version rolls out. The client gets a broken response, partial data, or a connection reset. Graceful shutdown = zero-downtime deploys.
+
+### Exercise 5.3: Stateless design with Redis session storage
+
+**The scaling problem:** Load balancer routes `request N+1` to a different instance than `request N`. If session state lives in the instance's local memory, the user "loses" their conversation.
+
+```
+Instance 1: User A sends Q1 → stores history in dict → responds
+Instance 2: User A sends Q2 → empty dict → "Hello, who are you?"
+```
+
+**The fix:** Externalize state to Redis (key-value store accessible from any instance).
+
+```
+Instance 1: save `session:{uuid}` to Redis (TTL 3600s)
+Instance 2: GET `session:{uuid}` from Redis → continues conversation
+```
+
+**Implementation in `production/app.py`:**
+
+```python
+def save_session(session_id: str, data: dict, ttl_seconds: int = 3600):
+    serialized = json.dumps(data)
+    _redis.setex(f"session:{session_id}", ttl_seconds, serialized)
+```
+
+- `setex` = SET + EXPIRE in one atomic command. Sessions auto-expire after 1 hour of inactivity — no manual cleanup.
+- History capped at 20 messages (10 turns) to prevent unbounded memory growth.
+- Fallback: if Redis is unreachable at startup, code falls back to in-memory dict and prints a warning. This is for local dev only — production must have Redis.
+
+**Stateless contract for scaling:**
+- No instance holds any user-specific state across requests
+- Any instance can serve any request for any user
+- Add/remove instances freely — no rebalancing logic needed
+- Horizontal scaling = just bump replica count
+
+### Exercise 5.4: Load balancing with Nginx + Docker Compose scale
+
+**Topology (port 8080 on host):**
+
+```
+Client → :8080 → Nginx (load balancer)
+                   ├── agent-1 (replica 1) ─┐
+                   ├── agent-2 (replica 2) ─┼─→ Redis (shared state)
+                   └── agent-3 (replica 3) ─┘
+```
+
+**Key files:**
+
+- `docker-compose.yml` declares `replicas: 3` for the `agent` service. Docker Compose's internal DNS (`agent` service name) auto-resolves to all 3 container IPs.
+- `nginx.conf` uses `upstream agent_cluster { server agent:8000; }` — Nginx queries Docker's DNS resolver (`127.0.0.11`) every 10s to discover new instances, so scaling up/down happens automatically without Nginx reload.
+- `resolver 127.0.0.11 valid=10s;` enables Docker's embedded DNS.
+- `keepalive 16` reuses TCP connections to backends (avoids handshake overhead per request).
+- `proxy_next_upstream error timeout http_503` — if one instance is unhealthy, Nginx retries on the next instance.
+- `add_header X-Served-By $upstream_addr always;` — exposes the backend IP in response headers for debugging.
+
+**Bring up + test:**
+
+```powershell
+docker compose -f 05-scaling-reliability/production/docker-compose.yml up -d --scale agent=3
+curl http://localhost:8080/health
+python 05-scaling-reliability/production/test_stateless.py
+docker compose -f 05-scaling-reliability/production/docker-compose.yml down
+```
+
+**`test_stateless.py` proves statelessness:** sends 5 questions, prints `served_by` from each response (the `INSTANCE_ID` env var, unique per container). If >1 instance ID appears in output, the load balancer is working AND Redis is correctly sharing state — different instances served different requests but the conversation history is intact.
+
+**Observed behavior:** Requests round-robin across instances; `/chat/{session_id}/history` returns the full 10-message history regardless of which instance handled which request — proof that Redis is the source of truth, not local memory.
+
 
