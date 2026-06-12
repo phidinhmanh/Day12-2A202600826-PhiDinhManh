@@ -58,17 +58,93 @@ Client (Port 80) ────> Nginx (Reverse Proxy/LB)
 ## Part 3: Cloud Deployment
 
 ### Exercise 3.1: Railway vs Render Deployment Configuration Comparison
-- **Railway Configuration (`railway.toml`):**
-  - **Builder:** Uses `builder = "NIXPACKS"`, which automatically detects the runtime, installs dependencies, and prepares the runner image without needing a custom Dockerfile.
-  - **Start Command:** Uses `startCommand = "uvicorn app:app --host 0.0.0.0 --port $PORT"`. The port is dynamically injected by Railway using `$PORT`.
-  - **Health Check:** Uses `healthcheckPath = "/health"` and `healthcheckTimeout = 30` directly inside the configuration file.
-  - **Restart Policy:** Defined via `restartPolicyType = "ON_FAILURE"` and `restartPolicyMaxRetries = 3`.
-- **Render Configuration (`render.yaml`):**
-  - **Infrastructure as Code (IaC):** Uses Render blueprints (`render.yaml`).
-  - **Service Types:** Declares both a web service (`ai-agent`) and a Redis service (`agent-cache`) together, allowing infrastructure dependencies to be configured and spun up in sync.
-  - **Runtime & Version:** Explicitly defines `runtime: python` and specifies `PYTHON_VERSION` (3.11.0) under `envVars`.
-  - **Build Command:** Defines `buildCommand: pip install -r requirements.txt` separately from `startCommand`.
-  - **Secrets & Auto-Generation:** Can define env keys like `AGENT_API_KEY` with `generateValue: true` to let Render generate random keys, and set `sync: false` to allow manual dashboard settings.
+
+| Aspect | Railway (`railway.toml`) | Render (`render.yaml`) |
+|---|---|---|
+| **Config Style** | Single config file, applies to current project/service | Blueprint — declares multiple services in one file |
+| **Builder** | `NIXPACKS` (auto-detect, no Dockerfile required) | `buildCommand: pip install -r requirements.txt` (explicit) |
+| **Port Binding** | Railway injects `$PORT` env var automatically | Render injects `$PORT` env var automatically |
+| **Start Command** | `uvicorn app:app --host 0.0.0.0 --port $PORT` | `uvicorn app:app --host 0.0.0.0 --port $PORT` |
+| **Health Check** | `healthcheckPath = "/health"`, `healthcheckTimeout = 30` | `healthCheckPath: /health` |
+| **Restart Policy** | `restartPolicyType = "ON_FAILURE"`, `maxRetries = 3` | Implicit — Render restarts on health check failure |
+| **Secrets** | Set via CLI (`railway variables set`) or Dashboard | Declarative: `sync: false` (manual) or `generateValue: true` (auto) |
+| **Multi-Service** | One file = one service; Redis/DB added as separate services | Single YAML declares web + Redis together with dependency links |
+| **Region** | Inherited from project settings | Explicit: `region: singapore` |
+| **Plan/Tier** | Set in Dashboard | Declarative: `plan: free` |
+| **Auto Deploy** | Branch-based via project settings | `autoDeploy: true` per-service |
+| **Runtime Pin** | Inferred by NIXPACKS | Explicit: `PYTHON_VERSION: 3.11.0` |
+
+**Key takeaways:**
+- **Railway = minimal config, CLI-first, quick start.** One file, fewer knobs.
+- **Render = IaC-first, multi-service blueprints, Git-driven.** Better for teams that want infra-as-code.
+- **Both inject `$PORT`** — app MUST read `os.getenv("PORT")`, never hardcode `8000`.
+
+### Exercise 3.2: Railway CLI deployment workflow (dry-run first)
+
+> **Golden rule:** Always run `railway status` BEFORE `railway up` to verify which project + environment you are deploying to. `railway up` deploys immediately — there is no "staging" by default.
+
+**Standard deploy steps:**
+
+```powershell
+# 1. Install Railway CLI (requires Node.js)
+npm install -g @railway/cli
+
+# 2. Login (opens browser)
+railway login
+
+# 3. Initialize project (run from project root)
+cd 03-cloud-deployment/railway
+railway init
+# → Choose: "Empty project" or link to existing
+# → Choose environment: production
+
+# 4. DRY-RUN CHECK — verify target project before deploying
+railway status
+# Confirms: project name, environment, service, branch
+
+# 5. Set secrets via CLI (never commit)
+railway variables set OPENAI_API_KEY=sk-your-key-here
+railway variables set ENVIRONMENT=production
+railway variables set AGENT_API_KEY=$(openssl rand -hex 32)
+
+# 6. Verify variables set
+railway variables
+
+# 7. Deploy — runs from current directory
+railway up
+# → Streams build + deploy logs to terminal
+# → Returns deployment URL when ready
+
+# 8. Open deployed app
+railway open
+
+# 9. Verify health endpoint
+curl https://<your-app>.up.railway.app/health
+
+# 10. Test agent
+curl -X POST https://<your-app>.up.railway.app/ask `
+  -H "Content-Type: application/json" `
+  -d '{"question":"Hello Railway"}'
+
+# 11. Tail live logs
+railway logs
+
+# 12. Rollback if needed
+railway rollback
+```
+
+**Dry-run safety checklist:**
+- [ ] Ran `railway status` — confirmed project + env
+- [ ] All secrets set via `railway variables set`, none in code
+- [ ] `railway.toml` committed, `requirements.txt` pinned
+- [ ] Local `python app.py` works on `PORT=8000`
+- [ ] `/health` endpoint returns 200 before deploying
+
+**Common pitfalls:**
+- Hardcoding `port=8000` → app fails to start on Railway's random `$PORT`. Use `os.getenv("PORT")`.
+- Forgetting `railway.toml` → NIXPACKS auto-detects but you lose health check + restart policy.
+- Committing `.env` → Railway will not load it. Use `railway variables set` instead.
+- No `/health` route → health check fails silently, no auto-restart on crash.
 
 ---
 
