@@ -31,18 +31,30 @@ from pydantic import BaseModel
 import uvicorn
 from utils.mock_llm import ask
 
-# ── Redis (optional — fallback to in-memory dict nếu không có Redis)
-try:
-    import redis
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    _redis = redis.from_url(REDIS_URL, decode_responses=True)
+# ── Redis (REQUIRED in production — fail-fast if missing)
+import os as _os
+ENVIRONMENT = _os.getenv("ENVIRONMENT", "development")
+REDIS_URL = _os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+if ENVIRONMENT == "production":
+    # In production, Redis is mandatory — fail fast instead of silently degrading
+    import redis as _redis_mod
+    _redis = _redis_mod.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=3)
     _redis.ping()
     USE_REDIS = True
-    print("✅ Connected to Redis")
-except Exception:
-    USE_REDIS = False
-    _memory_store: dict = {}
-    print("⚠️  Redis not available — using in-memory store (not scalable!)")
+    print("✅ Connected to Redis (production mode)")
+else:
+    # In dev/demo, allow in-memory fallback for local testing
+    try:
+        import redis
+        _redis = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=3)
+        _redis.ping()
+        USE_REDIS = True
+        print("✅ Connected to Redis")
+    except Exception as e:
+        USE_REDIS = False
+        _memory_store: dict = {}
+        print(f"⚠️  Redis not available ({e.__class__.__name__}) — using in-memory store (not scalable!)")
 
 
 logging.basicConfig(level=logging.INFO)

@@ -325,4 +325,122 @@ docker compose -f 05-scaling-reliability/production/docker-compose.yml down
 
 **Observed behavior:** Requests round-robin across instances; `/chat/{session_id}/history` returns the full 10-message history regardless of which instance handled which request — proof that Redis is the source of truth, not local memory.
 
+### Exercise 5.5: Live execution evidence (codex review gap fix)
+
+**Date:** 2026-06-12 | **Env:** Docker Desktop + Docker Compose v2 + Windows 11
+
+**Step 1: Bring up cluster (3 agents + Redis + Nginx)**
+
+```powershell
+docker compose -f 05-scaling-reliability/production/docker-compose.yml up -d --scale agent=3
+```
+
+Service state after startup:
+
+```
+NAME                  IMAGE                  SERVICE   STATUS                  PORTS
+production-agent-1    production-agent       agent     Up (health: starting)   8000/tcp
+production-agent-2    production-agent       agent     Up (health: starting)   8000/tcp
+production-agent-3    production-agent       agent     Up (health: starting)   8000/tcp
+production-nginx-1    nginx:alpine           nginx     Up                      0.0.0.0:8080->80/tcp
+production-redis-1    redis:7-alpine         redis     Up (healthy)            6379/tcp
+```
+
+**Step 2: Health probe + X-Served-By header rotation**
+
+```powershell
+curl -i http://localhost:8080/health
+```
+
+10 sequential hits, each from a different backend container:
+
+```
+X-Served-By: 172.20.0.4:8000
+X-Served-By: 172.20.0.5:8000
+X-Served-By: 172.20.0.3:8000
+X-Served-By: 172.20.0.4:8000
+X-Served-By: 172.20.0.5:8000
+X-Served-By: 172.20.0.3:8000
+X-Served-By: 172.20.0.4:8000
+X-Served-By: 172.20.0.5:8000
+X-Served-By: 172.20.0.3:8000
+X-Served-By: 172.20.0.4:8000
+```
+
+→ 3 distinct backends, strict round-robin. Nginx `upstream` + Docker DNS working.
+
+**Step 3: Backend instance IDs (via `/health` hit on each)**
+
+```json
+{"instance_id":"instance-1bcf36", "uptime_seconds":2359.7, "storage":"redis", "redis_connected":true}
+{"instance_id":"instance-af3689", "uptime_seconds":2359.6, "storage":"redis", "redis_connected":true}
+{"instance_id":"instance-7cfc30", "uptime_seconds":2359.2, "storage":"redis", "redis_connected":true}
+```
+
+→ 3 unique `INSTANCE_ID` values (UUID-derived), all connected to Redis. Stateful coupling = none.
+
+**Step 4: Stateless test (`test_stateless.py` output, real run)**
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python 05-scaling-reliability/production/test_stateless.py
+```
+
+```
+============================================================
+Stateless Scaling Demo
+============================================================
+
+Session ID: a80ffcf4-c7e5-41ee-894c-558cb6c12894
+
+Request 1: [instance-af3689]   Q: What is Docker?
+Request 2: [instance-7cfc30]   Q: Why do we need containers?
+Request 3: [instance-1bcf36]  Q: What is Kubernetes?
+Request 4: [instance-af3689]   Q: How does load balancing work?
+Request 5: [instance-7cfc30]   Q: What is Redis used for?
+
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'instance-1bcf36', 'instance-af3689', 'instance-7cfc30'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+  [user]: What is Docker?...
+  [user]: Why do we need containers?...
+  [user]: What is Kubernetes?...
+  [user]: How does load balancing work?...
+  [user]: What is Redis used for?...
+
+✅ Session history preserved across all instances via Redis!
+```
+
+**Verdict:** 3 instances, 5 requests, 3 distinct backend IDs, 10 messages intact in history. Stateless design **verified live**, not just claimed in prose.
+
+**Step 5: Production-mode Redis guard (anti-pattern fix)**
+
+`production/app.py` now enforces: if `ENVIRONMENT=production` and Redis ping fails, app crashes at startup (fail-fast). Fallback to in-memory store only allowed in `development` / `demo` mode.
+
+```python
+if ENVIRONMENT == "production":
+    import redis as _redis_mod
+    _redis = _redis_mod.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=3)
+    _redis.ping()   # raises ConnectionError if Redis down
+    USE_REDIS = True
+else:
+    try:
+        # ... original fallback logic
+    except Exception:
+        USE_REDIS = False
+        _memory_store: dict = {}
+```
+
+**Why this matters:** Previous code silently degraded to in-memory in production — cost guard, rate limiter, session storage all would have lied about persistence. The guard makes that bug impossible to ship.
+
+**Tear down:**
+
+```powershell
+docker compose -f 05-scaling-reliability/production/docker-compose.yml down
+```
+
 
